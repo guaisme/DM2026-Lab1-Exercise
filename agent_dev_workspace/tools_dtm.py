@@ -1,5 +1,7 @@
 from typing import List, Optional, Dict, Any
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.feature_extraction.text import CountVectorizer
 from langchain_core.tools import tool
 
@@ -126,4 +128,73 @@ def make_tools(session):
 
         return summary
 
-    return [build_dtm_tool, term_frequency_tool]
+    @tool
+    def dtm_heatmap_tool(n_terms: int = 20, n_documents: int = 20) -> Dict[str, Any]:
+        """Generates a heatmap of a positional slice of the raw document-term matrix (DTM).
+
+        `build_dtm_tool` must be run first to populate `session.feature_matrix` and `session.feature_names`.
+        Slices the raw DTM up to `n_documents` rows and `n_terms` columns in existing order without sorting.
+        Both `n_terms` and `n_documents` must be integers between 1 and 100 to keep the summary small on real datasets.
+        Renders an annotated Seaborn heatmap and assigns the figure to `session.pending_figure`.
+
+        Args:
+            n_terms: Number of terms (columns) to slice from the DTM (default 20, max 100).
+            n_documents: Number of documents (rows) to slice from the DTM (default 20, max 100).
+
+        Returns:
+            A dictionary containing result_id, matrix (nested list of Python ints), term_labels, and document_labels,
+            or an error dict if DTM is missing or arguments are out of bounds (1 to 100).
+        """
+        if session.feature_matrix is None or session.feature_names is None:
+            return {"error": "No document-term matrix found. Please run build_dtm_tool first."}
+
+        if not isinstance(n_terms, int) or not isinstance(n_documents, int):
+            return {"error": "n_terms and n_documents must be integers."}
+
+        if n_terms < 1 or n_terms > 100:
+            return {"error": f"n_terms must be between 1 and 100 (got {n_terms})."}
+
+        if n_documents < 1 or n_documents > 100:
+            return {"error": f"n_documents must be between 1 and 100 (got {n_documents})."}
+
+        sub_matrix = session.feature_matrix[0:n_documents, 0:n_terms].toarray()
+        term_labels = list(session.feature_names[0:n_terms])
+        doc_labels = [int(i) for i in range(sub_matrix.shape[0])]
+
+        matrix_nested = [[int(val) for val in row] for row in sub_matrix]
+
+        fig, ax = plt.subplots(figsize=(max(6, len(term_labels) * 0.5), max(4, len(doc_labels) * 0.4)))
+        sns.heatmap(
+            sub_matrix,
+            annot=True,
+            fmt="d",
+            xticklabels=term_labels,
+            yticklabels=doc_labels,
+            cmap="YlGnBu",
+            ax=ax
+        )
+        ax.set_xlabel("Terms")
+        ax.set_ylabel("Document Index")
+        ax.set_title(f"DTM Heatmap (First {len(doc_labels)} docs x {len(term_labels)} terms)")
+        plt.tight_layout()
+
+        session.pending_figure = fig
+
+        result_id = session.next_result_id("dtm_heatmap")
+
+        summary = {
+            "result_id": result_id,
+            "matrix": matrix_nested,
+            "term_labels": term_labels,
+            "document_labels": doc_labels
+        }
+
+        session.store_result(
+            tool_name="dtm_heatmap_tool",
+            args={"n_terms": n_terms, "n_documents": n_documents},
+            summary=summary
+        )
+
+        return summary
+
+    return [build_dtm_tool, term_frequency_tool, dtm_heatmap_tool]
