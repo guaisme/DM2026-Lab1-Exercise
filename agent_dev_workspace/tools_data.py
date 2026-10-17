@@ -3,6 +3,8 @@ from pathlib import Path
 import pandas as pd
 import nltk
 from nltk.tokenize import word_tokenize
+import matplotlib.pyplot as plt
+import seaborn as sns
 from langchain_core.tools import tool
 
 
@@ -142,15 +144,32 @@ def make_tools(session):
 
         df = session.dataframe
 
+        # Helper to check if a column contains unhashable types (list, dict, set)
+        def is_column_unhashable(col_name: str) -> bool:
+            series = df[col_name]
+            return series.apply(lambda val: isinstance(val, (list, dict, set))).any()
+
+        unhashable_cols = [c for c in df.columns if is_column_unhashable(c)]
+
         if subset is not None:
             missing_cols = [c for c in subset if c not in df.columns]
             if missing_cols:
                 return {"error": f"Columns specified in subset do not exist in dataset: {missing_cols}"}
 
-        first_dup_mask = df.duplicated(subset=subset, keep="first")
+            unhashable_in_subset = [c for c in subset if c in unhashable_cols]
+            if unhashable_in_subset:
+                return {"error": f"Cannot evaluate duplicates on unhashable column(s): {unhashable_in_subset}"}
+
+            eval_subset = list(subset)
+            excluded_cols = [c for c in df.columns if c not in eval_subset]
+        else:
+            eval_subset = [c for c in df.columns if c not in unhashable_cols]
+            excluded_cols = unhashable_cols
+
+        first_dup_mask = df.duplicated(subset=eval_subset, keep="first")
         n_duplicates = int(first_dup_mask.sum())
 
-        all_dup_mask = df.duplicated(subset=subset, keep=False)
+        all_dup_mask = df.duplicated(subset=eval_subset, keep=False)
         all_dup_indices = [int(idx) for idx in df.index[all_dup_mask].tolist()]
         n_rows_involved = len(all_dup_indices)
 
@@ -159,7 +178,7 @@ def make_tools(session):
         dtm_stale_note = None
 
         if drop and n_rows_involved > 0:
-            cleaned_df = df.drop_duplicates(subset=subset, keep=False).reset_index(drop=True)
+            cleaned_df = df.drop_duplicates(subset=eval_subset, keep=False).reset_index(drop=True)
             session.dataframe = cleaned_df
             rows_after = int(len(cleaned_df))
 
@@ -172,6 +191,8 @@ def make_tools(session):
             "result_id": result_id,
             "status": "success",
             "subset": subset,
+            "compared_columns": eval_subset,
+            "excluded_columns": excluded_cols,
             "n_duplicates": n_duplicates,
             "n_rows_involved": n_rows_involved,
             "duplicate_indices_preview": all_dup_indices[:10],
@@ -321,10 +342,161 @@ def make_tools(session):
 
         return summary
 
+    @tool
+    def describe_data_tool() -> Dict[str, Any]:
+        """Computes summary statistics on document text length and renders a box plot by category.
+
+        `load_dataset_tool` must be run first to populate `session.dataframe`.
+        Computes character length over `session.dataframe['text']` and calculates count, mean, std, min, 25%, 50%, 75%, max
+        both overall and grouped by `category_name`. Builds a Seaborn boxplot and sets `session.pending_figure`.
+
+        Returns:
+            A summary dictionary containing overall_stats and category_stats, or an error dict if dataset or required columns are missing.
+        """
+        if session.dataframe is None or session.dataframe.empty:
+            return {"error": "No dataset loaded. Please run load_dataset_tool first."}
+
+        df = session.dataframe
+
+        if "text" not in df.columns or "category_name" not in df.columns:
+            return {"error": "Required columns ('text' and 'category_name') are missing from dataset."}
+
+        # Compute temporary text_length Series without mutating session.dataframe
+        text_length = df["text"].fillna("").astype(str).apply(len)
+
+        def series_to_stats(s: pd.Series) -> Dict[str, float]:
+            desc = s.describe()
+            return {
+                "count": int(desc["count"]),
+                "mean": round(float(desc["mean"]), 4),
+                "std": round(float(desc["std"]), 4) if pd.notna(desc["std"]) else 0.0,
+                "min": float(desc["min"]),
+                "25%": float(desc["25%"]),
+                "50%": float(desc["50%"]),
+                "75%": float(desc["75%"]),
+                "max": float(desc["max"])
+            }
+
+        overall_stats = series_to_stats(text_length)
+
+        category_stats = {}
+        grouped = df.groupby("category_name")
+        for cat_name, group in grouped:
+            cat_len = text_length.loc[group.index]
+            category_stats[str(cat_name)] = series_to_stats(cat_len)
+
+        # Plot boxplot using temporary Series alongside category_name
+        plot_df = pd.DataFrame({
+            "category_name": df["category_name"],
+            "text_length": text_length
+        })
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.boxplot(data=plot_df, x="category_name", y="text_length", ax=ax)
+        ax.set_title("Text Length Distribution by Category")
+        ax.set_xlabel("Category")
+        ax.set_ylabel("Text Length (characters)")
+        fig.tight_layout()
+
+        session.pending_figure = fig
+
+        result_id = session.next_result_id("describe_data")
+
+        summary = {
+            "result_id": result_id,
+            "status": "success",
+            "overall_stats": overall_stats,
+            "category_stats": category_stats
+        }
+
+        # full_report combines overall and per-category stats into a clean DataFrame
+        report_rows = [{"group": "overall", **overall_stats}]
+        for cat, stats in category_stats.items():
+            report_rows.append({"group": f"category_{cat}", **stats})
+        full_report_df = pd.DataFrame(report_rows)
+
+        session.store_result(
+            tool_name="describe_data_tool",
+            args={},
+            summary=summary,
+            full_report=full_report_df
+        )
+
+        return summary
+
+    @tool
+    def inspect_data_tool(
+        n: int = 5,
+        start: int = 0,
+        max_chars: int = 100
+    ) -> Dict[str, Any]:
+        """Peeks at sequential rows of the working DataFrame for data inspection.
+
+        `load_dataset_tool` must be run first to populate `session.dataframe`.
+        Returns `n` consecutive rows starting at index `start` without random sampling.
+
+        Args:
+            n: Number of sequential rows to return (1 to 20, default 5).
+            start: Zero-based starting row index (0 <= start < total_rows, default 0).
+            max_chars: Maximum character length for text preview (20 to 500, default 100).
+
+        Returns:
+            A summary dictionary containing total_rows, column names, and row previews,
+            or an error dict if parameters are out of range or no dataset is loaded.
+        """
+        if session.dataframe is None or session.dataframe.empty:
+            return {"error": "No dataset loaded. Please run load_dataset_tool first."}
+
+        df = session.dataframe
+        total_rows = len(df)
+
+        if not isinstance(n, int) or n < 1 or n > 20:
+            return {"error": f"n must be an integer between 1 and 20 (got {n})."}
+
+        if not isinstance(start, int) or start < 0 or start >= total_rows:
+            return {"error": f"start index must be an integer between 0 and {total_rows - 1} (got {start})."}
+
+        if not isinstance(max_chars, int) or max_chars < 20 or max_chars > 500:
+            return {"error": f"max_chars must be an integer between 20 and 500 (got {max_chars})."}
+
+        sliced_df = df.iloc[start:start + n]
+        columns_list = [str(c) for c in df.columns]
+
+        rows_preview = []
+        for idx, row in sliced_df.iterrows():
+            orig_text = str(row["text"]) if "text" in row and pd.notna(row["text"]) else ""
+            cat_name = str(row["category_name"]) if "category_name" in row and pd.notna(row["category_name"]) else ""
+            rows_preview.append({
+                "index": int(idx),
+                "category_name": cat_name,
+                "text": orig_text[:max_chars],
+                "text_length": len(orig_text)
+            })
+
+        result_id = session.next_result_id("inspect_data")
+
+        summary = {
+            "result_id": result_id,
+            "status": "success",
+            "total_rows": total_rows,
+            "columns": columns_list,
+            "rows": rows_preview
+        }
+
+        session.store_result(
+            tool_name="inspect_data_tool",
+            args={"n": n, "start": start, "max_chars": max_chars},
+            summary=summary
+        )
+
+        return summary
+
     return [
         list_files_tool,
         check_missing_tool,
         check_duplicates_tool,
         sample_data_tool,
-        tokenize_tool
+        tokenize_tool,
+        describe_data_tool,
+        inspect_data_tool
     ]

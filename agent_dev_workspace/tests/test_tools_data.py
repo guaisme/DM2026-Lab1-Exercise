@@ -246,3 +246,145 @@ def test_tokenize_tool():
 
     tokenize_case.invoke({})
     assert session_case.dataframe["unigrams"].iloc[0] == ["alpha", "beta"]
+
+
+def test_describe_data_tool():
+    # Test error when no dataset loaded
+    session_no_df = SessionState()
+    data_tools_no_df = make_tools(session_no_df)
+    describe_no_df = next(t for t in data_tools_no_df if t.name == "describe_data_tool")
+    assert "error" in describe_no_df.invoke({})
+
+    # Load dataset
+    session = SessionState()
+    premade_tools, _ = load_workspace_tools("premade_tools", session)
+    load_dataset_tool = next(t for t in premade_tools if t.name == "load_dataset_tool")
+    data_tools = make_tools(session)
+    describe_data_tool = next(t for t in data_tools if t.name == "describe_data_tool")
+
+    load_dataset_tool.invoke({
+        "file_path": "agent_dev/sample_fixture.csv",
+        "text_column": "text",
+        "label_column": "label"
+    })
+
+    result = describe_data_tool.invoke({})
+    assert result["status"] == "success"
+    assert session.pending_figure is not None
+    assert "text_length" not in session.dataframe.columns
+
+    # Assert overall stats against TEST_FIXTURE #18
+    overall = result["overall_stats"]
+    assert overall["count"] == 8
+    assert pytest.approx(overall["mean"], abs=1e-4) == 19.875
+    assert pytest.approx(overall["std"], abs=1e-4) == 9.4330
+    assert pytest.approx(overall["min"], abs=1e-4) == 0.0
+    assert pytest.approx(overall["25%"], abs=1e-4) == 17.75
+    assert pytest.approx(overall["50%"], abs=1e-4) == 20.5
+    assert pytest.approx(overall["75%"], abs=1e-4) == 25.25
+    assert pytest.approx(overall["max"], abs=1e-4) == 30.0
+
+    # Assert catA stats against TEST_FIXTURE #18
+    catA = result["category_stats"]["catA"]
+    assert catA["count"] == 4
+    assert pytest.approx(catA["mean"], abs=1e-4) == 17.25
+    assert pytest.approx(catA["std"], abs=1e-4) == 12.5
+    assert pytest.approx(catA["min"], abs=1e-4) == 0.0
+    assert pytest.approx(catA["25%"], abs=1e-4) == 12.75
+    assert pytest.approx(catA["50%"], abs=1e-4) == 20.0
+    assert pytest.approx(catA["75%"], abs=1e-4) == 24.5
+    assert pytest.approx(catA["max"], abs=1e-4) == 29.0
+
+    # Assert catB stats against TEST_FIXTURE #18
+    catB = result["category_stats"]["catB"]
+    assert catB["count"] == 4
+    assert pytest.approx(catB["mean"], abs=1e-4) == 22.5
+    assert pytest.approx(catB["std"], abs=1e-4) == 5.7446
+    assert pytest.approx(catB["min"], abs=1e-4) == 18.0
+    assert pytest.approx(catB["25%"], abs=1e-4) == 18.0
+    assert pytest.approx(catB["50%"], abs=1e-4) == 21.0
+    assert pytest.approx(catB["75%"], abs=1e-4) == 25.5
+    assert pytest.approx(catB["max"], abs=1e-4) == 30.0
+
+
+def test_check_duplicates_after_tokenize():
+    session = SessionState()
+    premade_tools, _ = load_workspace_tools("premade_tools", session)
+    load_dataset_tool = next(t for t in premade_tools if t.name == "load_dataset_tool")
+    data_tools = make_tools(session)
+
+    check_duplicates_tool = next(t for t in data_tools if t.name == "check_duplicates_tool")
+    tokenize_tool = next(t for t in data_tools if t.name == "tokenize_tool")
+
+    load_dataset_tool.invoke({
+        "file_path": "agent_dev/sample_fixture.csv",
+        "text_column": "text",
+        "label_column": "label"
+    })
+
+    # Run tokenize_tool to add unigrams column containing lists
+    tokenize_tool.invoke({})
+    assert "unigrams" in session.dataframe.columns
+
+    # Run check_duplicates_tool with drop=True
+    result = check_duplicates_tool.invoke({"drop": True})
+    assert result["status"] == "success"
+    assert result["n_duplicates"] == 1
+    assert result["rows_after"] == 6
+
+
+# Note: inspect_data_tool has no contract or known answer in TEST_FIXTURE.md.
+# These expected values are derived directly from sample_fixture.csv raw data (and text lengths from TEST_FIXTURE #18).
+def test_inspect_data_tool():
+    # Test error when no dataset loaded
+    session_no_df = SessionState()
+    data_tools_no_df = make_tools(session_no_df)
+    inspect_no_df = next(t for t in data_tools_no_df if t.name == "inspect_data_tool")
+    assert "error" in inspect_no_df.invoke({})
+
+    session = SessionState()
+    premade_tools, _ = load_workspace_tools("premade_tools", session)
+    load_dataset_tool = next(t for t in premade_tools if t.name == "load_dataset_tool")
+    data_tools = make_tools(session)
+
+    inspect_data_tool = next(t for t in data_tools if t.name == "inspect_data_tool")
+    tokenize_tool = next(t for t in data_tools if t.name == "tokenize_tool")
+
+    load_dataset_tool.invoke({
+        "file_path": "agent_dev/sample_fixture.csv",
+        "text_column": "text",
+        "label_column": "label"
+    })
+
+    # Out of range error assertions (n=0, n=21, start=8, max_chars=19)
+    assert "error" in inspect_data_tool.invoke({"n": 0})
+    assert "error" in inspect_data_tool.invoke({"n": 21})
+    assert "error" in inspect_data_tool.invoke({"start": 8})
+    assert "error" in inspect_data_tool.invoke({"max_chars": 19})
+
+    # Test start=0, n=2
+    res_start0 = inspect_data_tool.invoke({"start": 0, "n": 2})
+    assert res_start0["status"] == "success"
+    assert res_start0["total_rows"] == 8
+    rows0 = res_start0["rows"]
+    assert [r["index"] for r in rows0] == [0, 1]
+    assert [r["text_length"] for r in rows0] == [29, 23]
+
+    # Test start=6, n=5 (only 2 rows remain: indices 6 and 7)
+    res_start6 = inspect_data_tool.invoke({"start": 6, "n": 5})
+    assert res_start6["status"] == "success"
+    rows6 = res_start6["rows"]
+    assert [r["index"] for r in rows6] == [6, 7]
+    assert rows6[1]["text_length"] == 0
+    assert rows6[1]["text"] == ""
+
+    # Test max_chars=20 (truncates preview to length 20 while full text_length remains 29)
+    res_max20 = inspect_data_tool.invoke({"start": 0, "n": 1, "max_chars": 20})
+    assert len(res_max20["rows"][0]["text"]) == 20
+    assert res_max20["rows"][0]["text_length"] == 29
+
+    # Test columns list after tokenize_tool ("unigrams" in columns list, but no row dict has "unigrams" key)
+    tokenize_tool.invoke({})
+    res_after_tok = inspect_data_tool.invoke({"start": 0, "n": 1})
+    assert "unigrams" in res_after_tok["columns"]
+    assert "unigrams" not in res_after_tok["rows"][0]
